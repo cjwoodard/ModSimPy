@@ -9,6 +9,8 @@ License: https://creativecommons.org/licenses/by/4.0)
 import logging
 logger = logging.getLogger(name='modsim.py')
 
+#TODO: Make this Python 3.7 when conda is ready
+
 # make sure we have Python 3.6 or better
 import sys
 if sys.version_info < (3, 6):
@@ -40,6 +42,8 @@ from scipy.integrate import odeint
 from scipy.integrate import solve_ivp
 from scipy.optimize import leastsq
 from scipy.optimize import minimize_scalar
+
+import scipy.optimize
 
 
 def flip(p=0.5):
@@ -179,27 +183,90 @@ def linrange(start=0, stop=None, step=1, **options):
     return array
 
 
+def magnitude(x):
+    """Returns the magnitude of a Quantity or number.
 
-def fit_leastsq(error_func, params, data, **options):
+    x: Quantity or number
+
+    returns: number
+    """
+    return x.magnitude if isinstance(x, Quantity) else x
+
+
+def magnitudes(x):
+    """Returns the magnitude of a Quantity or number, or sequence.
+
+    x: Quantity or number, or sequence
+
+    returns: number
+    """
+    try:
+        return [magnitude(elt) for elt in x]
+    except TypeError:           # not iterable
+        return magnitude(x)
+
+
+def units(x):
+    """Returns the units of a Quantity or number.
+
+    x: Quantity or number
+
+    returns: Unit object or 1
+    """
+    return x.units if isinstance(x, Quantity) else 1
+
+
+def remove_units(series):
+    """Removes units from the values in a Series.
+
+    Only removes units from top-level values;
+    does not traverse nested values.
+
+    returns: new Series object
+    """
+    res = copy(series)
+    print(type(res))
+    for label, value in res.iteritems():
+        res[label] = magnitude(value)
+    return res
+
+
+def require_units(x, units):
+    """Apply units to `x`, if necessary.
+
+    x: Quantity or number
+    units: Pint Units object
+
+    returns: Quantity
+    """
+    if isinstance(x, Quantity):
+        return x.to(units)
+    else:
+        return Quantity(x, units)
+
+
+def fit_leastsq(error_func, params, *args, **options):
     """Find the parameters that yield the best fit for the data.
 
     `params` can be a sequence, array, or Series
+
+    Whatever arguments are provided are passed along to `error_func`
 
     error_func: function that computes a sequence of errors
     params: initial guess for the best parameters
     data: the data to be fit; will be passed to min_fun
     options: any other arguments are passed to leastsq
     """
-    # to pass `data` to `leastsq`, we have to put it in a tuple
-    args = (data,)
+    # if any of the params are quantities, strip the units
+    x0 = [magnitude(x) for x in params]
 
     # override `full_output` so we get a message if something goes wrong
     options['full_output'] = True
 
     # run leastsq
-    #TODO: do we need to turn units off?
-    best_params, cov_x, infodict, mesg, ier = leastsq(error_func, x0=params,
-                                           args=args, **options)
+    with units_off():
+        best_params, cov_x, infodict, mesg, ier = leastsq(error_func,
+                                         x0=x0, args=args, **options)
 
     details = ModSimSeries(infodict)
     details.set(cov_x=cov_x, mesg=mesg, ier=ier)
@@ -238,6 +305,8 @@ def min_bounded(min_func, bounds, *args, **options):
 
     underride(options, xatol=1e-3)
 
+    # TODO: Do we need to remove units from bounds?
+
     with units_off():
         res = minimize_scalar(min_func,
                               bracket=bounds,
@@ -274,6 +343,26 @@ def max_bounded(max_func, bounds, *args, **options):
     # we have to negate the function value before returning res
     res.fun = -res.fun
     return res
+
+
+def minimize(min_func, x0, *args, **options):
+    """Finds the input value that minimizes `min_func`.
+
+    Wrapper for https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html
+
+    min_func: computes the function to be minimized
+    x0: initial guess
+    args: any additional positional arguments are passed to min_func
+    options: any keyword arguments are passed as options to minimize_scalar
+
+    returns: ModSimSeries object
+    """
+    underride(options, tol=1e-3)
+
+    with units_off():
+        res = scipy.optimize.minimize(min_func, x0, *args, **options)
+
+    return ModSimSeries(res)
 
 
 def run_odeint(system, slope_func, **options):
@@ -401,17 +490,11 @@ def run_ode_solver(system, slope_func, **options):
     # remove dimensions from the initial conditions.
     # we need this because otherwise `init` gets copied into the
     # results array along with its units
-    init_no_dim = [getattr(x, 'magnitude', x) for x in init]
-
-    # if the user did not provide t_eval or events, return
-    # equally spaced points
-    if 't_eval' not in options:
-        if not events:
-            options['t_eval'] = linspace(t_0, t_end, 51)
+    y_0 = [magnitude(x) for x in init]
 
     # run the solver
     with units_off():
-        bunch = solve_ivp(f, [t_0, t_end], init_no_dim, events=events, **options)
+        bunch = solve_ivp(f, [t_0, t_end], y_0, events=events, **options)
 
     # separate the results from the details
     y = bunch.pop('y')
@@ -436,11 +519,6 @@ def fsolve(func, x0, *args, **options):
 
     returns: solution as an array
     """
-    # when fsolve calls func, it always provides an array,
-    # even if there is only one element; so for consistency,
-    # we convert x0 to an array
-    #x0 = np.asarray(x0)
-
     # make sure we can run the given function with x0
     try:
         func(x0, *args)
@@ -453,6 +531,8 @@ def fsolve(func, x0, *args, **options):
 
     # make the tolerance more forgiving than the default
     underride(options, xtol=1e-6)
+
+    x0 = magnitude(x0)
 
     # run fsolve
     with units_off():
@@ -496,7 +576,13 @@ def interpolate(series, **options):
     underride(options, fill_value='extrapolate')
 
     # call interp1d, which returns a new function object
-    return interp1d(series.index, series.values, **options)
+    interp_func = interp1d(series.index, series.values, **options)
+
+    units = getattr(series, 'units', None)
+    if units:
+        return lambda x: Quantity(interp_func(x), units)
+    else:
+        return interp_func
 
 
 def interp_inverse(series, **options):
@@ -563,10 +649,28 @@ def plot(*args, **options):
 
     options are the same as for pyplot.plot
     """
-    underride(options, linewidth=3, alpha=0.6)
-    with units_off():
-        lines = plt.plot(*args, **options)
+    # TODO: add lines to REPLOT_CACHE
 
+    x, y, style = parse_plot_args(*args, **options)
+    if isinstance(x, pd.DataFrame) or isinstance(y, pd.DataFrame):
+        raise ValueError("modsimpy.plot can't handle DataFrames.")
+
+    if x is None:
+        if isinstance(y, np.ndarray):
+            x = np.arange(len(y))
+
+        if isinstance(y, pd.Series):
+            x = y.index
+            y = y.values
+
+    x = magnitudes(x)
+    y = magnitudes(y)
+    underride(options, linewidth=3, alpha=0.6)
+
+    if style is not None:
+        lines = plt.plot(x, y, style, **options)
+    else:
+        lines = plt.plot(x, y, **options)
     return lines
 
 REPLOT_CACHE = {}
@@ -594,6 +698,7 @@ def replot(*args, **options):
     line.set_xdata(x)
     line.set_ydata(y)
 
+
 def parse_plot_args(*args, **options):
     """Parse the args the same way plt.plot does."""
     x = None
@@ -609,11 +714,6 @@ def parse_plot_args(*args, **options):
             x, y = args
     elif len(args) == 3:
         x, y, style = args
-
-    # check if style is provided as a kwarg; if so,
-    # it can clobber a positional style argument
-    if 'style' in options:
-        style = options['style']
 
     return x, y, style
 
@@ -735,22 +835,6 @@ def subplot(nrows, ncols, plot_number, **options):
     fig.set_figheight(height)
 
 
-def ensure_units_array(value, units):
-    res = np.zeros_like(value)
-    for i in range(len(value)):
-        res[i] = Quantity(value[i], units[i])
-    return res
-
-
-def ensure_units(value, units):
-    if isinstance(value, np.ndarray):
-        return ensure_units_array(value, units)
-    else:
-        try:
-            return Quantity(value, units)
-        except TypeError:
-            return value
-
 class ModSimSeries(pd.Series):
     """Modified version of a Pandas Series,
     with a few changes to make it more suited to our purpose.
@@ -789,6 +873,12 @@ class ModSimSeries(pd.Series):
         """
         df = pd.DataFrame(self.values, index=self.index, columns=['values'])
         return df._repr_html_()
+
+    def __copy__(self, deep=True):
+        series = super().copy(deep=deep)
+        return self.__class__(series)
+
+    copy = __copy__
 
     def set(self, **kwargs):
         """Uses keyword arguments to update the Series in place.
@@ -1014,12 +1104,170 @@ class SweepFrame(ModSimDataFrame):
     row_constructor = SweepSeries
 
 
-class _Vector(Quantity):
+def Vector(*args, units=None):
+    """Make a ModSimVector.
+
+    args: can be a single argument or sequence
+    units: Pint Unit object or Quantity
+
+    If there's only one argument, it should be a sequence.
+
+    Otherwise, the arguments are treated as coordinates.
+
+    returns: ModSimVector
+    """
+    if len(args) == 1:
+        args = args[0]
+
+        # if it's a series, pull out the values
+        if isinstance(args, Series):
+            args = args.values
+
+    # see if any of the arguments have units; if so, save the first one
+    for elt in args:
+        found_units = getattr(elt, 'units', None)
+        if found_units:
+            break
+
+    if found_units:
+        # if there are units, remove them
+        args = [magnitude(elt) for elt in args]
+
+    # if the units keyword is provided, it overrides the units in args
+    if units is not None:
+        found_units = units
+
+    return ModSimVector(args, found_units)
+
+
+## Vector functions (should work with any sequence)
+
+def vector_mag(v):
+    """Vector magnitude with units.
+
+    returns: number or Quantity
+    """
+    return np.sqrt(np.dot(v, v)) * units(v)
+
+def vector_mag2(v):
+    """Vector magnitude squared with units.
+
+    returns: number of Quantity
+    """
+    return np.dot(v, v) * units(v) * units(v)
+
+def vector_angle(v):
+    """Angle between v and the positive x axis.
+
+    Only works with 2-D vectors.
+
+    returns: number in radians
+    """
+    assert len(v) == 2
+    x, y = v
+    return np.arctan2(y, x)
+
+def vector_polar(v):
+    """Vector magnitude and angle.
+
+    returns: (number or quantity, number in radians)
+    """
+    return vector_mag(v), vector_angle(v)
+
+def vector_hat(v):
+    """Unit vector in the direction of v.
+
+    The result should have no units.
+
+    returns: Vector or array
+    """
+    # get the size of the vector
+    mag = vector_mag(v)
+
+    # check if the magnitude of the Quantity is 0
+    if magnitude(mag) == 0:
+        if isinstance(v, ModSimVector):
+            return Vector(magnitude(v))
+        else:
+            return magnitude(np.asarray(v))
+    else:
+        return v / mag
+
+def vector_perp(v):
+    """Perpendicular Vector (rotated left).
+
+    Only works with 2-D Vectors.
+
+    returns: Vector
+    """
+    assert len(v) == 2
+    x, y = v
+    return Vector(-y, x)
+
+def vector_dot(v, w):
+    """Dot product of v and w.
+
+    returns: number or Quantity
+    """
+    return np.dot(v, w) * units(v) * units(w)
+
+def vector_cross(v, w):
+    """Cross product of v and w.
+
+    returns: number or Quantity for 2-D, Vector for 3-D
+    """
+    res = np.cross(v, w)
+
+    if len(v)==3 and (isinstance(v, ModSimVector) or
+                      isinstance(w, ModSimVector)):
+        return ModSimVector(res, units(v) * units(w))
+    else:
+        return res * units(v) * units(w)
+
+def vector_proj(v, w):
+    """Projection of v onto w.
+
+    Results has the units of v, but that might not make sense unless
+    v and w have the same units.
+
+    returns: array or Vector with direction of w and units of v.
+    """
+    w_hat = vector_hat(w)
+    return vector_dot(v, w_hat) * w_hat
+
+def scalar_proj(v, w):
+    """Returns the scalar projection of v onto w.
+
+    Which is the magnitude of the projection of v onto w.
+
+    Results has the units of v, but that might not make sense unless
+    v and w have the same units.
+
+    returns: scalar with units of v.
+    """
+    return vector_dot(v, vector_hat(w))
+
+def vector_dist(v, w):
+    """Euclidean distance from v to w, with units."""
+    if isinstance(v, list):
+        v = np.asarray(v)
+    return vector_mag(v-w)
+
+def vector_diff_angle(v, w):
+    """Angular difference between two vectors, in radians.
+    """
+    if len(v) == 2:
+        return vector_angle(v) - vector_angle(w)
+    else:
+        #TODO: see http://www.euclideanspace.com/maths/algebra/
+        # vectors/angleBetween/
+        raise NotImplementedError()
+
+
+class ModSimVector(Quantity):
     """Represented as a Pint Quantity with a NumPy array
 
     x, y, z, mag, mag2, and angle are accessible as attributes.
-
-    Supports vector operations hat, dot, cross, proj, and comp.
     """
 
     @property
@@ -1040,92 +1288,29 @@ class _Vector(Quantity):
     @property
     def mag(self):
         """Returns the magnitude with units."""
-        return np.sqrt(np.dot(self, self)) * self.units
+        return vector_mag(self)
 
     @property
     def mag2(self):
         """Returns the magnitude squared with units."""
-        return np.dot(self, self) * self.units
+        return vector_mag2(self)
 
     @property
     def angle(self):
         """Returns the angle between self and the positive x axis."""
-        return np.arctan2(self.y, self.x)
+        return vector_angle(self)
 
-    def polar(self):
-        """Returns magnitude and angle."""
-        return self.mag, self.angle
+    # make the vector functions available as methods
+    polar = vector_polar
+    hat = vector_hat
+    perp = vector_perp
+    dot = vector_dot
+    cross = vector_cross
+    proj = vector_proj
+    comp = scalar_proj
+    dist = vector_dist
+    diff_angle = vector_diff_angle
 
-    def hat(self):
-        """Returns the unit vector in the direction of self."""
-        return self / self.mag
-
-    def perp(self):
-        """Returns a perpendicular Vector (rotated left).
-
-        Only works with 2-D Vectors.
-
-        returns: Vector
-        """
-        assert len(self) == 2
-        return Vector(-self.y, self.x)
-
-    def dot(self, other):
-        """Returns the dot product of self and other."""
-        return np.dot(self, other) * self.units * other.units
-
-    def cross(self, other):
-        """Returns the cross product of self and other."""
-        return np.cross(self, other) * self.units * other.units
-
-    def proj(self, other):
-        """Returns the projection of self onto other."""
-        return np.dot(self, other) * other.hat()
-
-    def comp(self, other):
-        """Returns the magnitude of the projection of self onto other."""
-        return np.dot(self, other.hat()) * other.units
-
-    def dist(self, other):
-        """Euclidean distance from self to other, with units."""
-        diff = self - other
-        return diff.mag
-
-    def diff_angle(self, other):
-        """Angular difference between two vectors, in radians.
-        """
-        if len(self) == 2:
-            return self.angle - other.angle
-        else:
-            #TODO: see http://www.euclideanspace.com/maths/algebra/
-            # vectors/angleBetween/
-            raise NotImplementedError()
-
-
-def Vector(*args, units=None):
-    # if there's only one argument, it should be iterable
-    if len(args) == 1:
-        args = args[0]
-
-        # if it's a series, pull out the values
-        if isinstance(args, Series):
-            args = args.values
-
-    # see if any of the arguments have units; if so, save the first one
-    for elt in args:
-        found_units = getattr(elt, 'units', None)
-        if found_units:
-            break
-
-    if found_units:
-        # if there are units, remove them
-        args = [getattr(elt, 'magnitude', elt) for elt in args]
-
-    # if the units keyword is provided, it overrides the units in args
-    if units is not None:
-        found_units = units
-
-    return _Vector(args, found_units)
 
 
 def plot_segment(A, B, **options):
